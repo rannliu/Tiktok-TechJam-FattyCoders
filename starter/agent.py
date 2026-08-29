@@ -137,10 +137,102 @@ CATEGORY_PHRASE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ---------------------------------------------------------------------------
+# EXPERIMENT A (temporary, flagged) -- swap the final clarification slot from
+# "brand" to "feature".
+#
+# Rationale: local_evaluator.classify_constraint() has no "brand" branch at
+# all, so a simulated customer can never answer a "brand" clarification
+# question -- that turn is always wasted. "feature" is classify_constraint()'s
+# fallback/default bucket and covers a large share of constraint content in
+# the public intent cards, but was never being asked about.
+#
+# This flag exists ONLY so both configurations can be tested against the
+# committed 0.560 Phase 3 baseline before deciding whether to keep the
+# change. It changes nothing else: not BM25 weights, not query construction,
+# not catalog normalization, not session memory, not override handling, not
+# ASK_UNTIL_TURN/turn limits.
+#
+# ENABLE_FEATURE_CLARIFICATION = False reproduces the exact frozen Phase 3
+# ATTRIBUTE_PRIORITY (including "brand") with no other behavior change.
+# ---------------------------------------------------------------------------
+ENABLE_FEATURE_CLARIFICATION = True
+
+# ---------------------------------------------------------------------------
+# EXPERIMENT B (temporary, flagged, nested under Experiment A) -- a more
+# aggressive reordering of ATTRIBUTE_PRIORITY, still fully static (no
+# candidate-aware or adaptive logic of any kind -- that was the separate,
+# already-rejected "adaptive clarification" experiment).
+#
+# Every inclusion/exclusion below is justified strictly by how often
+# local_evaluator.classify_constraint() actually labels a constraint that
+# way across all 200 public_set intent cards (i.e. how often a simulated
+# customer is even capable of answering a question about that attribute):
+#
+#     feature:   404   <- classify_constraint()'s fallback/default bucket;
+#                          by far the largest source of revealable content,
+#                          and (like Experiment A found for the old "brand"
+#                          slot) was completely unreachable in Phase 3
+#                          because ATTRIBUTE_PRIORITY never asked about it.
+#     material:  302   <- already in Phase 3 / Experiment A, kept as-is.
+#     color:      60   <- already in Phase 3 / Experiment A, kept as-is.
+#     style:      19   <- already in Phase 3 / Experiment A, kept, but moved
+#                          after "feature" since feature's yield is ~20x
+#                          larger and ASK_UNTIL_TURN=5 means slot order
+#                          determines which attributes actually get asked.
+#     size:       11   <- classify_constraint() clearly supports this
+#                          (size/sizing/width/wide/narrow keywords) but it
+#                          was never in ATTRIBUTE_PRIORITY at all in Phase 3
+#                          or Experiment A. Added last: real yield, but the
+#                          smallest of the attributes classify_constraint()
+#                          ever produces double digits for.
+#     use_case:    4   <- kept in its existing first-slot position, unchanged
+#                          from Phase 3 / Experiment A, for consistency --
+#                          this experiment only touches the slots Experiment
+#                          A didn't already validate.
+#     budget:      0   <- REMOVED. intent_card() (local_evaluator.py) always
+#                          appends the price-derived "budget around $X"
+#                          candidate last, after material/color candidates
+#                          that get inserted at the front; since hard_
+#                          constraints/soft_preferences keep at most 4
+#                          candidates total, the price entry is essentially
+#                          always truncated away before it can ever reach a
+#                          customer reply. Verified: 0 of 800 classified
+#                          constraints across all 200 sessions are "budget".
+#                          Same failure mode as the old "brand" slot (a
+#                          clarification turn that can never be answered),
+#                          just caused by truncation rather than a missing
+#                          classify_constraint() branch.
+#     brand:       n/a  <- already removed by Experiment A; still absent
+#                          here for the same reason (no classify_constraint()
+#                          branch exists for it at all).
+#
+# Resulting order: use_case -> material -> color -> feature -> style -> size.
+#
+# NOTE: this is a bigger swing than Experiment A (two slots removed, one
+# reordered, one newly added) and was flagged as higher-risk / more exposed
+# to public-set-specific overfitting when proposed. It has not previously
+# been cleanly tested against the verified 0.560 baseline -- the earlier
+# "high-value clarification-order experiment" ran on top of a broken Phase 4
+# implementation and is not valid evidence either way.
+#
+# ENABLE_OPTIMIZED_CLARIFICATION_ORDER only has any effect when
+# ENABLE_FEATURE_CLARIFICATION is also True. Setting it False always falls
+# back to the verified Experiment A order. Setting ENABLE_FEATURE_CLARIFICATION
+# False overrides both flags and reproduces the exact frozen Phase 3 baseline.
+# ---------------------------------------------------------------------------
+ENABLE_OPTIMIZED_CLARIFICATION_ORDER = True
+
 # Order in which we probe for missing slots. Names match the evaluator's
 # ALLOWED_ATTRIBUTES vocabulary so ask_attribute values are meaningful to the
 # simulated customer (see local_evaluator.customer_reply / classify_constraint).
-ATTRIBUTE_PRIORITY = ["use_case", "material", "color", "budget", "style", "brand"]
+if ENABLE_FEATURE_CLARIFICATION:
+    if ENABLE_OPTIMIZED_CLARIFICATION_ORDER:
+        ATTRIBUTE_PRIORITY = ["use_case", "material", "color", "feature", "style", "size"]
+    else:
+        ATTRIBUTE_PRIORITY = ["use_case", "material", "color", "budget", "style", "feature"]
+else:
+    ATTRIBUTE_PRIORITY = ["use_case", "material", "color", "budget", "style", "brand"]
 
 # How many turns we're willing to spend asking clarifying questions before we
 # stop probing and just keep searching with whatever we've accumulated. This
