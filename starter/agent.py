@@ -120,7 +120,36 @@ def extract_category(message: str) -> str | None:
     if not match:
         return None
     phrase = _clean_phrase(match.group(1))
-    return phrase or None
+    if not phrase:
+        return None
+    
+    # Phase 2: Reject categories that look like attributes, not product types.
+    # Patterns like "is: leather", "is: waterproof", etc. are garbage extractions.
+    # Real categories are product types: "shoes", "jacket", "belt", "watch".
+    
+    lowered = phrase.lower()
+    
+    # If the phrase starts with "is:", "are:", "colon", or looks purely like an attribute,
+    # it's probably misparsed and should be rejected.
+    if lowered.startswith(("is:", "is ", "are:", "are ")):
+        return None
+    
+    # Reject pure material, color, style, or use-case matches.
+    # These are attributes, not categories.
+    pure_attribute_matches = (
+        MATERIAL_RE.search(phrase) or
+        COLOR_RE.search(phrase) or
+        STYLE_RE.search(phrase) or
+        USE_CASE_RE.search(phrase)
+    )
+    
+    # If the entire phrase is a single color/material/style word (no other words),
+    # reject it as a garbage category.
+    words = [w for w in _terms(phrase) if w]
+    if len(words) == 1 and pure_attribute_matches:
+        return None
+    
+    return phrase
 
 
 def extract_updates(message: str) -> dict:
@@ -195,7 +224,8 @@ def _seed_from_profile(state: dict, user_profile: object) -> None:
 
 
 def _log_turn(session_id: str, turn: int, user_message: str, state: dict, ask_attribute: object,
-              recommendations: list[dict]) -> None:
+              recommendations: list[dict], query_terms: list[str] | None = None,
+              override_detected: bool = False, fields_reset: list[str] | None = None) -> None:
     if not DEBUG_ENABLED:
         return
     try:
@@ -204,6 +234,9 @@ def _log_turn(session_id: str, turn: int, user_message: str, state: dict, ask_at
             "session_id": session_id,
             "turn": turn,
             "user_message": user_message,
+            "override_detected": override_detected,
+            "fields_reset": fields_reset or [],
+            "query_terms": query_terms or [],
             "state": {
                 "category": state.get("category"),
                 "brand": state.get("brand"),
@@ -311,8 +344,23 @@ class Agent:
     def _apply_message(self, state: dict, user_message: str) -> None:
         state["history"].append(user_message)
 
+        # Extract structured updates first, before category extraction.
+        updates = extract_updates(user_message)
+        
         new_category = extract_category(user_message)
         override_cue = bool(OVERRIDE_RE.search(user_message))
+        
+        # Phase 2: Detect attribute-only overrides.
+        # If we have an override cue but only extracted attributes (not a new category),
+        # we should reset category-specific slots and clarification state, but keep
+        # the existing category focus.
+        attribute_only_override = (
+            override_cue and 
+            new_category is None and 
+            bool(updates) and
+            state.get("category") is not None
+        )
+        
         if new_category:
             is_change = state["category"] is None or override_cue or not _shares_word(new_category, state["category"])
             if is_change and state["category"] is not None and not _shares_word(new_category, state["category"]):
@@ -326,8 +374,13 @@ class Agent:
                 state["brand"] = None
                 state["asked"] = set()
             state["category"] = new_category
+        elif attribute_only_override:
+            # Phase 2: Customer changed their mind about attributes while keeping
+            # the same category (e.g., "Actually, I prefer black instead").
+            # Reset clarification state so we can ask about the refined goal.
+            state["asked"] = set()
 
-        updates = extract_updates(user_message)
+        # Apply extracted updates.
         for key, value in updates.items():
             if key == "style":
                 merged = list(dict.fromkeys([*(state.get("style") or []), *value]))
@@ -336,17 +389,41 @@ class Agent:
                 state[key] = value
 
     def _build_query_terms(self, state: dict, latest_message: str) -> list[str]:
+        """Build BM25 query terms from structured state and raw message.
+        
+        Phase 2: Separate category/product-type terms from attribute terms
+        to prevent stale attributes from dominating retrieval.
+        """
         parts: list[str] = []
-        for key in ("category", "brand", "color", "material", "department", "use_case"):
+        
+        # Category/product type gets priority weight through placement.
+        category = state.get("category")
+        if category:
+            parts.append(str(category))
+        
+        # Core attributes: brand, color, material, department, use_case.
+        # These are significant but secondary to category.
+        for key in ("brand", "color", "material", "department", "use_case"):
             value = state.get(key)
             if value:
                 parts.append(str(value))
+        
+        # Style preferences are lower-weight additions.
         if state.get("style"):
             parts.extend(state["style"])
-        # Always fold in the raw latest message too, so information that
-        # isn't captured by our small slot vocabulary (e.g. an unmodeled
-        # attribute, or a specific noun the customer used) isn't lost.
-        parts.append(latest_message)
+        
+        # Raw message adds recall for unmmodeled attributes and specific nouns.
+        # But don't include it if it would just duplicate the category
+        # (e.g., latest message is a customer reply with no new info).
+        raw_terms = set(_terms(latest_message))
+        if category:
+            category_terms = set(_terms(category))
+            # Only include raw message if it has content beyond the category.
+            if raw_terms - category_terms:
+                parts.append(latest_message)
+        else:
+            parts.append(latest_message)
+        
         text = " ".join(parts)
         return list(dict.fromkeys(_terms(text)))[:40]
 
@@ -361,7 +438,27 @@ class Agent:
             raise RuntimeError("reset must be called before respond")
         state = self._sessions[session_id]
 
+        # Store state before applying message for override detection logging.
+        state_before = {
+            "category": state.get("category"),
+            "color": state.get("color"),
+            "material": state.get("material"),
+            "use_case": state.get("use_case"),
+            "brand": state.get("brand"),
+        }
+
         self._apply_message(state, user_message)
+
+        # Detect which fields were reset/changed.
+        state_after = {
+            "category": state.get("category"),
+            "color": state.get("color"),
+            "material": state.get("material"),
+            "use_case": state.get("use_case"),
+            "brand": state.get("brand"),
+        }
+        override_detected = state_before != state_after
+        fields_reset = [k for k in state_before if state_before[k] != state_after[k]]
 
         unique_terms = self._build_query_terms(state, user_message)
         expression = " OR ".join(f'"{term}"' for term in unique_terms)
@@ -378,7 +475,8 @@ class Agent:
         ask_attribute = _choose_ask_attribute(state, turn)
         message = _compose_message(recommendations, ask_attribute)
 
-        _log_turn(session_id, turn, user_message, state, ask_attribute, recommendations)
+        _log_turn(session_id, turn, user_message, state, ask_attribute, recommendations,
+                  query_terms=unique_terms, override_detected=override_detected, fields_reset=fields_reset)
 
         return {
             "message": message,
