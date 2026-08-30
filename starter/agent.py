@@ -244,6 +244,58 @@ DEBUG_LOG_PATH = Path(os.environ.get("AGENT_DEBUG_LOG_PATH", "debug_logs/convers
 
 
 # ---------------------------------------------------------------------------
+# CROSS-TURN CONSENSUS ("remembering" good candidates from earlier turns)
+#
+# The problem this fixes: after a few clarifying questions, the customer
+# runs out of new things to tell us and starts repeating the same answer
+# ("I don't have a preference"). When that happens, the search query stops
+# changing turn after turn -- we call this the query being "frozen". We
+# noticed that sometimes a product was ranked pretty well a few turns ago,
+# on an earlier version of the search, but has since dropped out of the
+# top results because later turns changed the ranking. That earlier good
+# candidate is still a reasonable guess -- we just stopped showing it.
+#
+# The fix: once the query has frozen (same search twice in a row) and we've
+# seen at least 2 different searches so far this conversation, we combine
+# today's top results with the top results from those earlier searches.
+# A product that showed up near the top more than once (even if it's not
+# near the top right now) gets a boost. This only reuses result lists the
+# search already produced earlier in the SAME conversation -- it does not
+# run any extra searches and never looks at the correct answer.
+# ---------------------------------------------------------------------------
+def _env_flag(name: str, default: bool) -> bool:
+    """Read a True/False setting from an environment variable.
+
+    If the environment variable isn't set at all, just use `default`.
+    """
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+# Turns the consensus feature above on or off. Tested and confirmed to
+# help, so it's on by default.
+ENABLE_CROSS_TURN_CONSENSUS = _env_flag("ENABLE_CROSS_TURN_CONSENSUS", True)
+
+# CONSENSUS_RRF_K: a "softening" number used when turning a product's rank
+# position (1st, 2nd, 3rd...) into a score. A bigger number means position
+# matters a little less. 60 is a common default used in search systems.
+CONSENSUS_RRF_K = 60
+
+# CONSENSUS_WEIGHT: how much we trust "this product ranked well on an
+# earlier search this conversation" compared to "this product ranks well
+# on the current search". 0.45 means the current search still matters
+# more, but earlier good results can still help a product move up.
+CONSENSUS_WEIGHT = 0.45
+
+# CONSENSUS_HISTORY_DEPTH: how many of each earlier search's top results we
+# remember and are allowed to bring back later in the conversation. This
+# was tested at 50 and 100 -- 50 worked better, so that's the value we keep.
+CONSENSUS_HISTORY_DEPTH = 50
+
+
+# ---------------------------------------------------------------------------
 # Frozen configuration.
 #
 # Earlier experiments tried two extra features behind flags:
@@ -518,6 +570,218 @@ def _compose_message(recommendations: list[dict], ask_attribute: str | None) -> 
     return base
 
 
+def _apply_cross_turn_consensus(
+    state: dict,
+    query_signature: tuple[str, ...],
+    candidate_ids: list[str],
+    top_k: int,
+) -> list[str]:
+    """EXPERIMENT C: conservative cross-turn candidate consensus.
+
+    Records each distinct query state's Top-K candidate list exactly as the
+    baseline agent already produced it (no extra retrieval, no ground
+    truth). Once the current query signature repeats (clarification has
+    frozen) and at least two distinct query states have been seen, blends
+    the current ranking with a reciprocal-rank consensus signal built from
+    candidates that were plausible across other, previously seen query
+    states -- including candidates that have since fallen out of the
+    current Top-K -- and returns a reranked candidate list. Otherwise
+    returns candidate_ids unchanged.
+    """
+    history = state.setdefault("consensus_history", {})
+    last_signature = state.get("last_consensus_signature")
+
+    # Record this query state's Top-K once, the first time we see it.
+    if query_signature not in history:
+        history[query_signature] = list(candidate_ids[:CONSENSUS_HISTORY_DEPTH])
+
+    is_frozen = last_signature is not None and query_signature == last_signature
+    state["last_consensus_signature"] = query_signature
+
+    if not is_frozen or len(history) < 2:
+        return candidate_ids
+
+    # Candidate union: current Top-K plus every other distinct query
+    # state's stored Top-K, deduplicated by parent_asin. This union order
+    # also doubles as the deterministic tiebreaker below.
+    union: list[str] = []
+    seen: set[str] = set()
+    for asin in candidate_ids:
+        if asin not in seen:
+            seen.add(asin)
+            union.append(asin)
+    for signature, ranked in history.items():
+        if signature == query_signature:
+            continue
+        for asin in ranked:
+            if asin not in seen:
+                seen.add(asin)
+                union.append(asin)
+
+    current_rank = {asin: i for i, asin in enumerate(candidate_ids)}
+
+    def _score(asin: str) -> float:
+        current_score = (
+            1.0 / (CONSENSUS_RRF_K + current_rank[asin] + 1)
+            if asin in current_rank
+            else 0.0
+        )
+        historical_score = 0.0
+        for signature, ranked in history.items():
+            if signature == query_signature:
+                continue
+            if asin in ranked:
+                historical_score += 1.0 / (CONSENSUS_RRF_K + ranked.index(asin) + 1)
+        return current_score + CONSENSUS_WEIGHT * historical_score
+
+    # Stable sort keeps the deterministic union order above as the tiebreaker.
+    union.sort(key=_score, reverse=True)
+    return union[:top_k]
+
+
+# ---------------------------------------------------------------------------
+# TIE-BREAK BONUS STEP
+#
+# This runs AFTER we already have our list of candidate products (the ones
+# BM25 search found, possibly reordered by the consensus step above). It
+# does NOT search for new products and it never looks at the correct
+# answer -- it just nudges the existing list of candidates a little, so
+# products that clearly match what the customer already told us can move
+# up a few spots.
+#
+# There are two on/off switches (flags) for two different bonus ideas:
+#
+#   ENABLE_CONSTRAINT_BONUS -- give a small bonus to a candidate if it
+#     matches at least 2 of the things the customer already told us
+#     (material, color, department, brand, use case, or style). We tested
+#     this and it made the ranking WORSE overall, so it stays OFF by
+#     default. The code is kept here (turned off) instead of deleted, in
+#     case someone wants to re-test it later.
+#
+#   ENABLE_CATEGORY_BONUS -- give a small bonus to a candidate if its
+#     title/category text shares 2+ words with the product category the
+#     customer is looking for (e.g. "running shoes"). We tested this and
+#     it made the ranking BETTER overall, so it is ON by default.
+#
+# Both bonuses are small on purpose: they are only meant to break ties
+# between candidates that BM25 already ranked close together, not to
+# override BM25's ordering completely.
+# ---------------------------------------------------------------------------
+ENABLE_CONSTRAINT_BONUS = _env_flag("ENABLE_CONSTRAINT_BONUS", False)  # tested, made things worse -> stays off
+ENABLE_CATEGORY_BONUS = _env_flag("ENABLE_CATEGORY_BONUS", True)  # tested, made things better -> stays on
+
+TIEBREAK_RRF_K = 60          # same "how much rank position matters" constant used by consensus above
+TIEBREAK_BONUS_WEIGHT = 0.02  # how big one bonus "point" is worth (kept small on purpose)
+TIEBREAK_MIN_MATCHES = 2      # need at least this many matches before ENABLE_CONSTRAINT_BONUS gives anything
+
+
+def _apply_tiebreak_bonus(
+    connection: sqlite3.Connection,
+    state: dict,
+    candidate_ids: list[str],
+    top_k: int,
+) -> list[str]:
+    """Re-sort an already-retrieved list of candidates using small bonuses.
+
+    Nothing here fetches new products from the database beyond looking up
+    details for the candidates we already have. If both bonus flags are
+    off, this function just returns the list unchanged.
+    """
+    # If there's nothing to rerank, or both bonuses are turned off, do nothing.
+    if not candidate_ids or not (ENABLE_CONSTRAINT_BONUS or ENABLE_CATEGORY_BONUS):
+        return candidate_ids
+
+    # Step 1: look up the product details we need for every candidate, in
+    # one database query (faster than one query per candidate).
+    placeholders = ",".join("?" for _ in candidate_ids)
+    rows = connection.execute(
+        f"SELECT parent_asin, title, categories, department, material_field, "
+        f"color_field, brand_field FROM products WHERE parent_asin IN ({placeholders})",
+        candidate_ids,
+    ).fetchall()
+
+    # Turn the database rows into an easy-to-use dictionary:
+    # {product_id: {"title": ..., "categories": ..., ...}}
+    fields = {
+        str(row[0]): {
+            "title": (row[1] or "").lower(),
+            "categories": (row[2] or "").lower(),
+            "department": (row[3] or "").lower(),
+            "material_field": (row[4] or "").lower(),
+            "color_field": (row[5] or "").lower(),
+            "brand_field": (row[6] or "").lower(),
+        }
+        for row in rows
+    }
+
+    # The words in the category the customer is currently looking for
+    # (e.g. "running shoes" -> {"running", "shoes"}). Used by the category
+    # bonus below.
+    state_category_terms = set(_terms(str(state.get("category") or "")))
+
+    def _bonus(asin: str) -> float:
+        """Work out how big a bonus one candidate product should get."""
+        info = fields.get(asin)
+        if not info:
+            return 0.0
+
+        total = 0.0
+
+        # --- Bonus idea A: does this product match what we already know? ---
+        if ENABLE_CONSTRAINT_BONUS:
+            matches = 0
+            # Check the simple one-to-one fields first: does the customer's
+            # stated material/color/department/brand appear in the matching
+            # product field?
+            for state_key, field_key in (
+                ("material", "material_field"),
+                ("color", "color_field"),
+                ("department", "department"),
+                ("brand", "brand_field"),
+            ):
+                value = state.get(state_key)
+                if value and str(value).strip().lower() in info[field_key]:
+                    matches += 1
+            # Use case and style don't have their own database column, so
+            # we just check if the word shows up in the product title.
+            state_use_case = state.get("use_case")
+            if state_use_case and str(state_use_case).strip().lower() in info["title"]:
+                matches += 1
+            for style_value in state.get("style") or []:
+                if str(style_value).strip().lower() in info["title"]:
+                    matches += 1
+                    break  # one style match is enough, no need to keep checking
+            # Only give a bonus once we have enough matches (avoids
+            # rewarding a single very common word like "black").
+            if matches >= TIEBREAK_MIN_MATCHES:
+                total += TIEBREAK_BONUS_WEIGHT * matches
+
+        # --- Bonus idea B: does this product's category match? ---
+        if ENABLE_CATEGORY_BONUS and state_category_terms:
+            candidate_terms = set(_terms(info["title"])) | set(_terms(info["categories"]))
+            overlap = len(state_category_terms & candidate_terms)
+            if overlap >= 2:
+                total += TIEBREAK_BONUS_WEIGHT * overlap
+
+        return total
+
+    # Step 2: turn "position in the list" into a score, the same way the
+    # consensus step above does (products near the top of the list start
+    # with a higher score than products near the bottom).
+    current_rank = {asin: i for i, asin in enumerate(candidate_ids)}
+
+    def _score(asin: str) -> float:
+        base_score_from_position = 1.0 / (TIEBREAK_RRF_K + current_rank[asin] + 1)
+        return base_score_from_position + _bonus(asin)
+
+    # Step 3: sort candidates by their new score (position score + bonus),
+    # highest score first. This can move a candidate up a few spots if it
+    # earned a bonus, but a large gap in position score is still hard for a
+    # small bonus to overcome -- so BM25's ordering still mostly wins.
+    reranked = sorted(candidate_ids, key=_score, reverse=True)
+    return reranked
+
+
 class Agent:
     """Stateful, rule-based baseline: per-session slot memory + SQLite BM25 retrieval.
 
@@ -598,6 +862,9 @@ class Agent:
             "style": [],
             "history": [],
             "asked": set(),
+            # EXPERIMENT C: per-session cross-turn consensus bookkeeping.
+            "consensus_history": {},
+            "last_consensus_signature": None,
         }
         _seed_from_profile(state, user_profile)
         self._sessions[session_id] = state
@@ -734,12 +1001,35 @@ class Agent:
         if not expression:
             recommendations: list[dict] = []
         else:
+            # EXPERIMENT C: when consensus is enabled, retrieve deeper than
+            # top_k so there is a Top-50 (CONSENSUS_HISTORY_DEPTH) pool for
+            # _apply_cross_turn_consensus to remember per distinct query
+            # state. When consensus is disabled this is exactly top_k, same
+            # as the always-verified baseline query.
+            retrieval_limit = (
+                max(top_k, CONSENSUS_HISTORY_DEPTH)
+                if ENABLE_CROSS_TURN_CONSENSUS
+                else top_k
+            )
             rows = self.connection.execute(
                 f"SELECT parent_asin FROM products WHERE products MATCH ? "
                 f"ORDER BY {self._bm25_sql} LIMIT ?",
-                (expression, top_k),
+                (expression, retrieval_limit),
             ).fetchall()
             candidate_ids = [str(row[0]) for row in rows]
+
+            # EXPERIMENT C: optional cross-turn consensus rerank. When the
+            # flag is off, candidate_ids is used exactly as the baseline
+            # retrieval produced it, below -- this branch does not run.
+            if ENABLE_CROSS_TURN_CONSENSUS:
+                query_signature = tuple(unique_terms)
+                candidate_ids = _apply_cross_turn_consensus(
+                    state, query_signature, candidate_ids, top_k
+                )
+
+            if ENABLE_CONSTRAINT_BONUS or ENABLE_CATEGORY_BONUS:
+                candidate_ids = _apply_tiebreak_bonus(self.connection, state, candidate_ids, top_k)
+
             recommendations = [{"parent_asin": asin} for asin in candidate_ids[:top_k]]
 
         ask_attribute = _choose_ask_attribute(state, turn)
