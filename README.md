@@ -90,10 +90,10 @@ python3 -m venv .venv
 source .venv/bin/activate
 ```
 
-Install project dependencies if a requirements file is provided:
+### Dependencies
+```markdown
 
-```bash
-pip install -r requirements.txt
+Findly does not require any third-party Python packages. The final agent uses only Python's standard library, including SQLite with FTS5 support, and does not require any external API keys.
 ```
 
 The final Findly retrieval pipeline itself is intentionally lightweight and does not require an external inference API.
